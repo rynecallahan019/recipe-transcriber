@@ -1,6 +1,7 @@
 import os
 import tempfile
 import subprocess
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,6 +24,17 @@ class TranscribeRequest(BaseModel):
 
 ALLOWED_API_KEY = os.environ.get("TRANSCRIBER_API_KEY", "")
 
+@app.get("/")
+def root():
+    return {
+        "service": "Video Transcription API",
+        "status": "running",
+        "endpoints": {
+            "GET /health": "Health check",
+            "POST /transcribe": "Transcribe video from URL (max 7 minutes)"
+        }
+    }
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -44,6 +56,39 @@ def transcribe(req: TranscribeRequest):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         audio_path = os.path.join(tmpdir, "audio.mp3")
+
+        # First, get video info to check duration
+        info_cmd = [
+            "yt-dlp",
+            "--dump-json",
+            "--no-playlist",
+            url
+        ]
+        
+        try:
+            info_result = subprocess.run(
+                info_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if info_result.returncode == 0:
+                import json
+                video_info = json.loads(info_result.stdout)
+                duration = video_info.get("duration", 0)
+                
+                # Check if video is longer than 7 minutes (420 seconds)
+                if duration > 420:
+                    minutes = duration / 60
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Video is too long ({minutes:.1f} minutes). Maximum allowed is 7 minutes."
+                    )
+        except json.JSONDecodeError:
+            pass  # Continue if we can't get duration
+        except subprocess.TimeoutExpired:
+            pass  # Continue if info check times out
 
         # Download audio using yt-dlp
         cmd = [
