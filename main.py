@@ -90,13 +90,15 @@ def transcribe(req: TranscribeRequest):
         except subprocess.TimeoutExpired:
             pass  # Continue if info check times out
 
-        # Download audio using yt-dlp
+       # Download audio using yt-dlp with user agent to avoid bot detection
         cmd = [
             "yt-dlp",
             "--no-playlist",
             "-x",
             "--audio-format", "mp3",
             "--audio-quality", "0",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--extractor-args", "youtube:player_client=android",
             "-o", audio_path,
             url
         ]
