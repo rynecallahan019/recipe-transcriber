@@ -1,143 +1,193 @@
+"""
+Savoryne recipe video service (Render).
+
+POST /transcribe  {"url": "...", "api_key": "...", "frames": 8}
+  -> {"title", "caption", "transcript", "has_speech", "duration", "frames": [base64 jpeg, ...]}
+
+Downloads the video with yt-dlp, transcribes the audio (if any) with OpenAI,
+grabs evenly spaced snapshots with ffmpeg, and returns the creator's caption,
+so the recipe can be drafted even when nobody talks in the video.
+
+Env vars:
+  OPENAI_API_KEY        required
+  TRANSCRIBER_API_KEY   shared secret sent by WordPress (api_key)
+  TRANSCRIBE_MODEL      optional, default "whisper-1"
+  MAX_FRAMES            optional, default 8
+"""
+
+import base64
+import glob
 import os
-import tempfile
+import re
 import subprocess
-import json
+import tempfile
+
+import static_ffmpeg
+import yt_dlp
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from openai import OpenAI
+from pydantic import BaseModel
 
-app = FastAPI()
+# Puts ffmpeg + ffprobe on PATH (downloaded at build time; system ffmpeg wins if present).
+static_ffmpeg.add_paths(weak=True)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST"],
-    allow_headers=["*"],
-)
+API_KEY = os.environ.get("TRANSCRIBER_API_KEY", "")
+TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
+MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "8"))
+MAX_AUDIO_SECONDS = 600
+MAX_VIDEO_SECONDS = int(os.environ.get("MAX_VIDEO_SECONDS", "420"))  # 7 minutes
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+client = OpenAI()
+app = FastAPI(title="Savoryne video service")
+
+
+class VideoTooLong(Exception):
+    pass
+
 
 class TranscribeRequest(BaseModel):
     url: str
-    api_key: str  # WordPress sends this to verify requests
+    api_key: str = ""
+    frames: int | None = None
 
-ALLOWED_API_KEY = os.environ.get("TRANSCRIBER_API_KEY", "")
+
+def run(cmd, timeout=120):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def friendly_error(err) -> str:
+    msg = ANSI.sub("", str(err)).lower()
+    if "unsupported url" in msg:
+        return "That link isn’t a supported video. Paste a TikTok, Instagram, Facebook, Vimeo or X link."
+    if any(w in msg for w in ("private", "login", "log in", "sign in", "cookies")):
+        return "That video is private or needs a login, so it can’t be read."
+    if any(w in msg for w in ("404", "not found", "unavailable", "removed", "deleted")):
+        return "That video is unavailable. It may have been removed."
+    return "That video couldn’t be downloaded. Check the link and try again."
+
+
+def download(url: str, folder: str):
+    opts = {
+        "outtmpl": os.path.join(folder, "video.%(ext)s"),
+        "format": "b[height<=720]/bv*[height<=720]+ba/b/bv*+ba",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "max_filesize": 250 * 1024 * 1024,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if info.get("entries"):
+            info = info["entries"][0] or {}
+        duration = float(info.get("duration") or 0)
+        if duration > MAX_VIDEO_SECONDS:
+            raise VideoTooLong(f"That video is {duration / 60:.1f} minutes long. The limit is {MAX_VIDEO_SECONDS // 60} minutes.")
+        info = ydl.process_ie_result(info, download=True)
+    files = [f for f in glob.glob(os.path.join(folder, "video.*")) if not f.endswith((".part", ".ytdl"))]
+    if not files:
+        raise RuntimeError("Download produced no file.")
+    return info, files[0]
+
+
+def has_stream(path: str, kind: str) -> bool:
+    r = run(["ffprobe", "-v", "error", "-select_streams", kind, "-show_entries", "stream=index", "-of", "csv=p=0", path], 30)
+    return r.returncode == 0 and r.stdout.strip() != ""
+
+
+def probe_duration(path: str) -> float:
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path], 30)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def extract_audio(video: str, folder: str):
+    out = os.path.join(folder, "audio.mp3")
+    r = run(["ffmpeg", "-y", "-loglevel", "error", "-i", video, "-vn", "-ac", "1", "-ar", "16000",
+             "-b:a", "48k", "-t", str(MAX_AUDIO_SECONDS), out], 180)
+    if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
+        return out
+    return None
+
+
+def transcribe_audio(path: str) -> str:
+    with open(path, "rb") as f:
+        result = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=f)
+    return (getattr(result, "text", "") or "").strip()
+
+
+def extract_frames(video: str, duration: float, count: int, folder: str):
+    if count <= 0:
+        return []
+    n = count if duration > 4 else 1
+    frames = []
+    for i in range(n):
+        t = duration * (i + 0.5) / n if duration > 0 else 0
+        out = os.path.join(folder, f"frame{i}.jpg")
+        r = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", video, "-frames:v", "1",
+                 "-vf", "scale='min(768,iw)':-2", "-q:v", "5", out], 60)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            with open(out, "rb") as f:
+                frames.append(base64.b64encode(f.read()).decode("ascii"))
+    return frames
+
 
 @app.get("/")
-def root():
-    return {
-        "service": "Video Transcription API",
-        "status": "running",
-        "endpoints": {
-            "GET /health": "Health check",
-            "POST /transcribe": "Transcribe video from URL (max 7 minutes)"
-        }
-    }
-
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
+
 
 @app.post("/transcribe")
 def transcribe(req: TranscribeRequest):
-    # Verify the request is coming from your WordPress site
-    if ALLOWED_API_KEY and req.api_key != ALLOWED_API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    if API_KEY and req.api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
 
     url = req.url.strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="No URL provided")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Paste a full video link that starts with https://")
 
-    # Validate it's a supported video URL
-    supported = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com", "facebook.com", "vimeo.com", "twitter.com", "x.com"]
-    if not any(d in url for d in supported):
-        raise HTTPException(status_code=400, detail="Unsupported video platform")
+    count = max(0, min(12, req.frames if req.frames is not None else MAX_FRAMES))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = os.path.join(tmpdir, "audio.mp3")
-
-        # First, get video info to check duration
-        info_cmd = [
-            "yt-dlp",
-            "--dump-json",
-            "--no-playlist",
-            url
-        ]
-        
+    with tempfile.TemporaryDirectory() as tmp:
         try:
-            info_result = subprocess.run(
-                info_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if info_result.returncode == 0:
-                import json
-                video_info = json.loads(info_result.stdout)
-                duration = video_info.get("duration", 0)
-                
-                # Check if video is longer than 7 minutes (420 seconds)
-                if duration > 420:
-                    minutes = duration / 60
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Video is too long ({minutes:.1f} minutes). Maximum allowed is 7 minutes."
-                    )
-        except json.JSONDecodeError:
-            pass  # Continue if we can't get duration
-        except subprocess.TimeoutExpired:
-            pass  # Continue if info check times out
+            info, video = download(url, tmp)
+        except VideoTooLong as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:  # yt-dlp raises several error types
+            print("Download failed:", ANSI.sub("", str(e)), flush=True)
+            raise HTTPException(status_code=400, detail=friendly_error(e))
 
-       # Download audio using yt-dlp with better bot avoidance
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--extractor-args", "youtube:player_client=android,web",
-            "--no-check-certificates",
-            "-o", audio_path,
-            url
-        ]
+        duration = float(info.get("duration") or 0) or probe_duration(video)
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Video download timed out. Try a shorter video.")
+        transcript = ""
+        if has_stream(video, "a"):
+            audio = extract_audio(video, tmp)
+            if audio:
+                try:
+                    transcript = transcribe_audio(audio)
+                except Exception as e:
+                    print("Transcription failed:", e, flush=True)
 
-        if result.returncode != 0:
-            err = result.stderr[-500:] if result.stderr else "Unknown error"
-            raise HTTPException(status_code=422, detail=f"Could not download video: {err}")
+        frames = extract_frames(video, duration, count, tmp) if has_stream(video, "v") else []
 
-        # yt-dlp sometimes appends .mp3 to the output path
-        if not os.path.exists(audio_path):
-            audio_path = audio_path + ".mp3" if os.path.exists(audio_path + ".mp3") else None
-            if not audio_path:
-                raise HTTPException(status_code=422, detail="Audio file not found after download")
+    caption = (info.get("description") or "").strip()
+    title = (info.get("title") or "").strip()
 
-        # Check file size (Whisper limit is 25MB)
-        file_size = os.path.getsize(audio_path)
-        if file_size > 24 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Audio file too large (max ~24MB). Try a shorter video.")
+    if not transcript and not caption and not frames:
+        raise HTTPException(status_code=422, detail="Nothing usable was found in that video. Try a different link.")
 
-        # Transcribe with Whisper
-        try:
-            with open(audio_path, "rb") as f:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    response_format="text"
-                )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
-
-    return {"transcript": transcript}
+    return {
+        "title": title,
+        "caption": caption,
+        "transcript": transcript,
+        "has_speech": len(transcript.split()) >= 8,
+        "duration": duration,
+        "frames": frames,
+    }

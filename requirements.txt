@@ -1,6 +1,5 @@
 fastapi
-uvicorn
-yt-dlp
+uvicorn[standard]
+yt-dlp[default,curl-cffi]
+static-ffmpeg
 openai
-python-multipart
-requests
